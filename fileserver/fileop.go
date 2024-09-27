@@ -30,7 +30,7 @@ import (
 	"sort"
 	"syscall"
 
-	jwt "github.com/golang-jwt/jwt/v5"
+	"github.com/gorilla/mux"
 	"github.com/haiwen/seafile-server/fileserver/blockmgr"
 	"github.com/haiwen/seafile-server/fileserver/commitmgr"
 	"github.com/haiwen/seafile-server/fileserver/diff"
@@ -230,6 +230,136 @@ func parseCryptKey(rsp http.ResponseWriter, repoID string, user string, version 
 	}
 
 	return seafileKey, nil
+}
+
+func accessV2CB(rsp http.ResponseWriter, r *http.Request) *appError {
+	vars := mux.Vars(r)
+	repoID := vars["repoid"]
+	filePath := vars["filepath"]
+
+	if filePath == "" {
+		msg := "No file path\n"
+		return &appError{nil, msg, http.StatusBadRequest}
+	}
+	// filePath will be unquote by mux, we need to escape filePath before calling check file access.
+	escPath := url.PathEscape(filePath)
+	rpath := getCanonPath(filePath)
+	fileName := filepath.Base(rpath)
+
+	op := r.URL.Query().Get("op")
+	if op != "view" && op != "download" {
+		msg := "Operation is neither view or download\n"
+		return &appError{nil, msg, http.StatusBadRequest}
+	}
+
+	token := utils.GetAuthorizationToken(r.Header)
+	cookie := r.Header.Get("Cookie")
+
+	if token == "" && cookie == "" {
+		msg := "Both token and cookie are not set\n"
+		return &appError{nil, msg, http.StatusBadRequest}
+	}
+
+	user, appErr := checkFileAccess(repoID, token, cookie, escPath, "download")
+	if appErr != nil {
+		return appErr
+	}
+
+	repo := repomgr.Get(repoID)
+	if repo == nil {
+		msg := "Bad repo id"
+		return &appError{nil, msg, http.StatusBadRequest}
+	}
+
+	fileID, _, err := fsmgr.GetObjIDByPath(repo.StoreID, repo.RootID, rpath)
+	if err != nil {
+		msg := "Invalid file_path\n"
+		return &appError{nil, msg, http.StatusBadRequest}
+	}
+
+	etag := r.Header.Get("If-None-Match")
+	if etag == fileID {
+		return &appError{nil, "", http.StatusNotModified}
+	}
+
+	rsp.Header().Set("ETag", fileID)
+	rsp.Header().Set("Cache-Control", "private, no-cache")
+
+	ranges := r.Header["Range"]
+	byteRanges := strings.Join(ranges, "")
+
+	var cryptKey *seafileCrypt
+	if repo.IsEncrypted {
+		key, err := parseCryptKey(rsp, repoID, user, repo.EncVersion)
+		if err != nil {
+			return err
+		}
+		cryptKey = key
+	}
+
+	exists, _ := fsmgr.Exists(repo.StoreID, fileID)
+	if !exists {
+		msg := "Invalid file id"
+		return &appError{nil, msg, http.StatusBadRequest}
+	}
+
+	if !repo.IsEncrypted && len(byteRanges) != 0 {
+		if err := doFileRange(rsp, r, repo, fileID, fileName, op, byteRanges, user); err != nil {
+			return err
+		}
+	} else if err := doFile(rsp, r, repo, fileID, fileName, op, cryptKey, user); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+type UserInfo struct {
+	User string `json:"user"`
+}
+
+func checkFileAccess(repoID, token, cookie, filePath, op string) (string, *appError) {
+	tokenString, err := utils.GenSeahubJWTToken()
+	if err != nil {
+		err := fmt.Errorf("failed to sign jwt token: %v", err)
+		return "", &appError{err, "", http.StatusInternalServerError}
+	}
+	url := fmt.Sprintf("%s/repos/%s/check-access/?path=%s", option.SeahubURL, repoID, filePath)
+	header := map[string][]string{
+		"Authorization": {"Token " + tokenString},
+	}
+	if cookie != "" {
+		header["Cookie"] = []string{cookie}
+	}
+	req := make(map[string]string)
+	req["op"] = op
+	if token != "" {
+		req["token"] = token
+	}
+	msg, err := json.Marshal(req)
+	if err != nil {
+		err := fmt.Errorf("failed to encode access token: %v", err)
+		return "", &appError{err, "", http.StatusInternalServerError}
+	}
+	status, body, err := utils.HttpCommon("POST", url, header, bytes.NewReader(msg))
+	if err != nil {
+		if status != http.StatusInternalServerError {
+			msg := "No permission to access file\n"
+			return "", &appError{nil, msg, http.StatusForbidden}
+		} else {
+			err := fmt.Errorf("failed to get access token info: %v", err)
+			return "", &appError{err, "", http.StatusInternalServerError}
+		}
+	}
+
+	info := new(UserInfo)
+	err = json.Unmarshal(body, &info)
+	if err != nil {
+		err := fmt.Errorf("failed to decode access token info: %v", err)
+		return "", &appError{err, "", http.StatusInternalServerError}
+	}
+
+	return info.User, nil
 }
 
 func doFile(rsp http.ResponseWriter, r *http.Request, repo *repomgr.Repo, fileID string,
@@ -748,16 +878,19 @@ func downloadZipFile(rsp http.ResponseWriter, r *http.Request, data, repoID, use
 		rsp.Header().Set("Content-Disposition", contFileName)
 		rsp.Header().Set("Content-Type", "application/octet-stream")
 
+		fileList := []string{}
 		for _, v := range dirList {
+			uniqueName := genUniqueFileName(v.Name, fileList)
+			fileList = append(fileList, uniqueName)
 			if fsmgr.IsDir(v.Mode) {
-				if err := packDir(ar, repo, v.ID, v.Name, cryptKey); err != nil {
+				if err := packDir(ar, repo, v.ID, uniqueName, cryptKey); err != nil {
 					if !isNetworkErr(err) {
 						log.Printf("failed to pack dir %s: %v", v.Name, err)
 					}
 					return nil
 				}
 			} else {
-				if err := packFiles(ar, &v, repo, "", cryptKey); err != nil {
+				if err := packFiles(ar, &v, repo, "", uniqueName, cryptKey); err != nil {
 					if !isNetworkErr(err) {
 						log.Printf("failed to pack file %s: %v", v.Name, err)
 					}
@@ -768,6 +901,39 @@ func downloadZipFile(rsp http.ResponseWriter, r *http.Request, data, repoID, use
 	}
 
 	return nil
+}
+
+func genUniqueFileName(fileName string, fileList []string) string {
+	var uniqueName string
+	var name string
+	i := 1
+	dot := strings.Index(fileName, ".")
+	if dot < 0 {
+		name = fileName
+	} else {
+		name = fileName[:dot]
+	}
+	uniqueName = fileName
+
+	for nameInFileList(uniqueName, fileList) {
+		if dot < 0 {
+			uniqueName = fmt.Sprintf("%s (%d)", name, i)
+		} else {
+			uniqueName = fmt.Sprintf("%s (%d).%s", name, i, fileName[dot+1:])
+		}
+		i++
+	}
+
+	return uniqueName
+}
+
+func nameInFileList(fileName string, fileList []string) bool {
+	for _, name := range fileList {
+		if name == fileName {
+			return true
+		}
+	}
+	return false
 }
 
 func parseDirFilelist(repo *repomgr.Repo, obj map[string]interface{}) ([]fsmgr.SeafDirent, error) {
@@ -802,14 +968,28 @@ func parseDirFilelist(repo *repomgr.Repo, obj map[string]interface{}) ([]fsmgr.S
 			err := fmt.Errorf("invalid download multi data")
 			return nil, err
 		}
-
-		v, ok := direntHash[name]
-		if !ok {
-			err := fmt.Errorf("invalid download multi data")
+		if name == "" {
+			err := fmt.Errorf("invalid download file name")
 			return nil, err
 		}
 
-		direntList = append(direntList, v)
+		if strings.Contains(name, "/") {
+			rpath := filepath.Join(parentDir, name)
+			dent, err := fsmgr.GetDirentByPath(repo.StoreID, repo.RootID, rpath)
+			if err != nil {
+				err := fmt.Errorf("failed to get path %s for repo %s: %v", rpath, repo.StoreID, err)
+				return nil, err
+			}
+			direntList = append(direntList, *dent)
+		} else {
+			v, ok := direntHash[name]
+			if !ok {
+				err := fmt.Errorf("invalid download multi data")
+				return nil, err
+			}
+
+			direntList = append(direntList, v)
+		}
 	}
 
 	return direntList, nil
@@ -844,7 +1024,7 @@ func packDir(ar *zip.Writer, repo *repomgr.Repo, dirID, dirPath string, cryptKey
 				return err
 			}
 		} else {
-			if err := packFiles(ar, v, repo, dirPath, cryptKey); err != nil {
+			if err := packFiles(ar, v, repo, dirPath, v.Name, cryptKey); err != nil {
 				return err
 			}
 		}
@@ -853,14 +1033,14 @@ func packDir(ar *zip.Writer, repo *repomgr.Repo, dirID, dirPath string, cryptKey
 	return nil
 }
 
-func packFiles(ar *zip.Writer, dirent *fsmgr.SeafDirent, repo *repomgr.Repo, parentPath string, cryptKey *seafileCrypt) error {
+func packFiles(ar *zip.Writer, dirent *fsmgr.SeafDirent, repo *repomgr.Repo, parentPath, baseName string, cryptKey *seafileCrypt) error {
 	file, err := fsmgr.GetSeafile(repo.StoreID, dirent.ID)
 	if err != nil {
 		err := fmt.Errorf("failed to get seafile : %v", err)
 		return err
 	}
 
-	filePath := filepath.Join(parentPath, dirent.Name)
+	filePath := filepath.Join(parentPath, baseName)
 	filePath = strings.TrimLeft(filePath, "/")
 
 	fileHeader := new(zip.FileHeader)
@@ -1941,7 +2121,8 @@ func notifRepoUpdate(repoID string, commitID string) error {
 	}
 
 	url := fmt.Sprintf("http://%s/events", option.NotificationURL)
-	token, err := genJWTToken(repoID, "")
+	exp := time.Now().Add(time.Second * 300).Unix()
+	token, err := utils.GenNotifJWTToken(repoID, "", exp)
 	if err != nil {
 		log.Printf("failed to generate jwt token: %v", err)
 		return err
@@ -3475,19 +3656,12 @@ type ShareLinkInfo struct {
 }
 
 func queryShareLinkInfo(token, cookie, opType string) (*ShareLinkInfo, *appError) {
-	claims := SeahubClaims{
-		time.Now().Add(time.Second * 300).Unix(),
-		true,
-		jwt.RegisteredClaims{},
-	}
-
-	jwtToken := jwt.NewWithClaims(jwt.GetSigningMethod("HS256"), &claims)
-	tokenString, err := jwtToken.SignedString([]byte(seahubPK))
+	tokenString, err := utils.GenSeahubJWTToken()
 	if err != nil {
 		err := fmt.Errorf("failed to sign jwt token: %v", err)
 		return nil, &appError{err, "", http.StatusInternalServerError}
 	}
-	url := fmt.Sprintf("%s?token=%s&type=%s", seahubURL+"/check-share-link-access/", token, opType)
+	url := fmt.Sprintf("%s?token=%s&type=%s", option.SeahubURL+"/check-share-link-access/", token, opType)
 	header := map[string][]string{
 		"Authorization": {"Token " + tokenString},
 	}
@@ -3496,12 +3670,12 @@ func queryShareLinkInfo(token, cookie, opType string) (*ShareLinkInfo, *appError
 	}
 	status, body, err := utils.HttpCommon("GET", url, header, nil)
 	if err != nil {
-		err := fmt.Errorf("failed to get share link info: %v", err)
-		return nil, &appError{err, "", http.StatusInternalServerError}
-	}
-	if status != http.StatusOK {
-		msg := "Link token not found"
-		return nil, &appError{nil, msg, http.StatusForbidden}
+		if status != http.StatusInternalServerError {
+			return nil, &appError{nil, string(body), status}
+		} else {
+			err := fmt.Errorf("failed to get share link info: %v", err)
+			return nil, &appError{err, "", http.StatusInternalServerError}
+		}
 	}
 
 	info := new(ShareLinkInfo)
@@ -3515,7 +3689,7 @@ func queryShareLinkInfo(token, cookie, opType string) (*ShareLinkInfo, *appError
 }
 
 func accessLinkCB(rsp http.ResponseWriter, r *http.Request) *appError {
-	if seahubPK == "" {
+	if option.JWTPrivateKey == "" {
 		err := fmt.Errorf("no seahub private key is configured")
 		return &appError{err, "", http.StatusNotFound}
 	}
@@ -3571,7 +3745,7 @@ func accessLinkCB(rsp http.ResponseWriter, r *http.Request) *appError {
 	}
 
 	rsp.Header().Set("ETag", fileID)
-	rsp.Header().Set("Cache-Control", "no-cache")
+	rsp.Header().Set("Cache-Control", "public, no-cache")
 
 	var cryptKey *seafileCrypt
 	if repo.IsEncrypted {

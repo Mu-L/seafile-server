@@ -300,6 +300,9 @@ class SeafileAPI(object):
     def del_file(self, repo_id, parent_dir, filename, username):
         return seafserv_threaded_rpc.del_file(repo_id, parent_dir, filename, username)
 
+    def batch_del_files(self, repo_id, filepaths, username):
+        return seafserv_threaded_rpc.batch_del_files(repo_id, filepaths, username)
+
     '''
     If you want to move or copy multiple files in a batch, @src_filename and @dst_filename
     should be json array, make sure the number of files
@@ -859,9 +862,6 @@ class SeafileAPI(object):
     def search_files_by_path (self, repo_id, path, search_str):
         return seafserv_threaded_rpc.search_files_by_path(repo_id, path, search_str)
 
-    def gen_notif_server_jwt (self, repo_id, username):
-        return seafserv_threaded_rpc.generate_notif_server_jwt (repo_id, username)
-    
 seafile_api = SeafileAPI()
 
 class CcnetAPI(object):

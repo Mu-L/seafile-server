@@ -43,7 +43,6 @@ var logFp *os.File
 
 var dbType string
 var seafileDB, ccnetDB *sql.DB
-var seahubURL, seahubPK string
 
 func init() {
 	flag.StringVar(&centralDir, "F", "", "central config directory")
@@ -264,22 +263,6 @@ func loadSeafileDB() {
 	dbType = dbEngine
 }
 
-func loadSeahubConfig() error {
-	seahubPK = os.Getenv("JWT_PRIVATE_KEY")
-	if seahubPK == "" {
-		return fmt.Errorf("failed to read JWT_PRIVATE_KEY")
-	}
-
-	siteRoot := os.Getenv("SITE_ROOT")
-	if siteRoot != "" {
-		seahubURL = fmt.Sprintf("http://127.0.0.1:8000%sapi/v2.1/internal", siteRoot)
-	} else {
-		seahubURL = "http://127.0.0.1:8000/api/v2.1/internal"
-	}
-
-	return nil
-}
-
 func writePidFile(pid_file_path string) error {
 	file, err := os.OpenFile(pid_file_path, os.O_CREATE|os.O_WRONLY, 0664)
 	if err != nil {
@@ -378,7 +361,7 @@ func main() {
 		fp.Close()
 	}
 
-	if err := loadSeahubConfig(); err != nil {
+	if err := option.LoadSeahubConfig(); err != nil {
 		log.Fatalf("Failed to read seahub config: %v", err)
 	}
 
@@ -486,6 +469,8 @@ func newHTTPRouter() *mux.Router {
 	//r.Handle("/u/{.*}", appHandler(uploadLinkCB))
 	r.Handle("/f/{.*}{slash:\\/?}", appHandler(accessLinkCB))
 	//r.Handle("/d/{.*}", appHandler(accessDirLinkCB))
+
+	r.Handle("/repos/{repoid:[\\da-z]{8}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{12}}/files/{filepath:.*}", appHandler(accessV2CB))
 
 	// file syncing api
 	r.Handle("/repo/{repoid:[\\da-z]{8}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{12}}/permission-check{slash:\\/?}",

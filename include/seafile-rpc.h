@@ -754,6 +754,12 @@ seafile_del_file (const char *repo_id,
                   const char *user,
                   GError **error);
 
+int
+seafile_batch_del_files (const char *repo_id,
+                         const char *file_list,
+                         const char *user,
+                         GError **error);
+
 /**
  * copy a file/directory from a repo to another on server.
  */
@@ -1148,9 +1154,6 @@ seafile_search_files (const char *repo_id, const char *str, GError **error);
 
 GList *
 seafile_search_files_by_path (const char *repo_id, const char *path, const char *str, GError **error);
-
-char *
-seafile_generate_notif_server_jwt (const char *repo_id, const char *username, GError **error);
 
 /*Following is ccnet rpc*/
 int

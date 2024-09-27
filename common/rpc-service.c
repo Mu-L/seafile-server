@@ -27,8 +27,6 @@
 #define DEBUG_FLAG SEAFILE_DEBUG_OTHER
 #include "log.h"
 
-#define CCNET_ERR_INTERNAL 500
-
 #ifndef SEAFILE_SERVER
 #include "../daemon/vc-utils.h"
 
@@ -2812,6 +2810,46 @@ out:
     return ret;
 }
 
+int
+seafile_batch_del_files (const char *repo_id,
+                         const char *filepaths,
+                         const char *user,
+                         GError **error)
+{
+    char *norm_file_list = NULL, *rpath = NULL;
+    int ret = 0;
+
+    if (!repo_id || !filepaths || !user) {
+        g_set_error (error, 0, SEAF_ERR_BAD_ARGS, "Argument should not be null");
+        return -1;
+    }
+
+    if (!is_uuid_valid (repo_id)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Invalid repo id");
+        return -1;
+    }
+
+
+    norm_file_list = normalize_utf8_path (filepaths);
+    if (!norm_file_list) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Path is in valid UTF8 encoding");
+        ret = -1;
+        goto out;
+    }
+
+    if (seaf_repo_manager_batch_del_files (seaf->repo_mgr, repo_id,
+                                           norm_file_list,
+                                           user, error) < 0) {
+        ret = -1;
+    }
+
+out:
+    g_free (norm_file_list);
+
+    return ret;
+}
+
 GObject *
 seafile_copy_file (const char *src_repo_id,
                    const char *src_dir,
@@ -4605,22 +4643,6 @@ seafile_search_files_by_path (const char *repo_id, const char *path, const char 
     return g_list_reverse (ret);
 }
 
-char *
-seafile_generate_notif_server_jwt (const char *repo_id, const char *username, GError **error)
-{
-    if (!repo_id || !username) {
-        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Argument should not be null");
-        return NULL;
-    }
-
-    char *token = seaf_gen_notif_server_jwt (repo_id, username);
-    if (!token) {
-        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_INTERNAL,
-                     "Failed to generate jwt token");
-    }
-    return token;
-}
-
 /*RPC functions merged from ccnet-server*/
 int
 ccnet_rpc_add_emailuser (const char *email, const char *passwd,
@@ -4686,7 +4708,7 @@ ccnet_rpc_get_emailuser (const char *email, GError **error)
     CcnetUserManager *user_mgr = seaf->user_mgr;
     CcnetEmailUser *emailuser = NULL;
     
-    emailuser = ccnet_user_manager_get_emailuser (user_mgr, email);
+    emailuser = ccnet_user_manager_get_emailuser (user_mgr, email, error);
     
     return (GObject *)emailuser;
 }
@@ -4702,7 +4724,7 @@ ccnet_rpc_get_emailuser_with_import (const char *email, GError **error)
     CcnetUserManager *user_mgr = seaf->user_mgr;
     CcnetEmailUser *emailuser = NULL;
 
-    emailuser = ccnet_user_manager_get_emailuser_with_import (user_mgr, email);
+    emailuser = ccnet_user_manager_get_emailuser_with_import (user_mgr, email, error);
 
     return (GObject *)emailuser;
 }
@@ -5408,7 +5430,7 @@ ccnet_rpc_get_org_emailusers (const char *url_prefix, int start , int limit,
     while (ptr) {
         char *email = ptr->data;
         CcnetEmailUser *emailuser = ccnet_user_manager_get_emailuser (user_mgr,
-                                                                      email);
+                                                                      email, NULL);
         if (emailuser != NULL) {
             ret = g_list_prepend (ret, emailuser);
         }
